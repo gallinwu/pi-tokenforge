@@ -34,6 +34,7 @@ import {
   dedupeKey,
   effectiveFloor,
   estimateTokens,
+  fnv1a,
   formatInt,
   reduce,
   utf8Bytes,
@@ -180,10 +181,20 @@ const spillIndex = new Map<string, SpillRecord>();
 const dedupeCache = new Map<string, { at: number; id: string; bytes: number }>();
 const stats: ForgeStats = createStats();
 let fullTrailersUsed = 0;
-let lastPruneAt = 0;
 
 function newId(): string {
   return Date.now().toString(36).slice(-6) + Math.random().toString(36).slice(2, 6);
+}
+
+/**
+ * Content-derived id, for anything whose output must be reproducible.
+ *
+ * Pruning output is the case: a resumed session re-runs the hook over the same
+ * messages and must land on the same placeholder bytes. A clock- or
+ * random-based id would break that on the second run.
+ */
+function contentId(text: string): string {
+  return "p" + fnv1a(text) + fnv1a(text.slice(0, 4096) + text.length);
 }
 
 /**
@@ -377,12 +388,6 @@ export default function tokenForge(pi: ExtensionAPI) {
   pi.on("context", (event, ctx) => {
     if (!config.pruneEnabled) return;
 
-    const now = Date.now();
-    // A prune rewrites history the provider has already cached, so it is rate
-    // limited and watermark-gated. Doing it every step would trade cheap cache
-    // reads for full-price inputs on every request.
-    if (now - lastPruneAt < 30_000) return;
-
     const usage = ctx.getContextUsage();
     if (!usage || usage.tokens === null) return;
     const watermark = Math.floor(usage.contextWindow * config.pruneWatermarkRatio);
@@ -392,14 +397,23 @@ export default function tokenForge(pi: ExtensionAPI) {
     const selection = selectPrunable(messages, config);
     if (selection.indexes.length === 0) return;
 
+    // The placeholder must be a pure function of the message it replaces.
+    //
+    // A resumed session replays the log and runs this hook again on the rebuilt
+    // transcript. If the locator carried a clock value or a random id, that
+    // second run would hand the model different bytes than the first — the
+    // transcript and the log would disagree, and every resume would invalidate
+    // whatever prefix cache the previous shape had earned. So the id is derived
+    // from the content, and the same message always lands in the same file.
     const pruned = applyPrune(messages, selection.indexes, (message) => {
       const text = messageText(message);
       if (!text) return null;
-      const id = newId();
+      const id = contentId(text);
+      const existing = spillIndex.get(id);
+      if (existing) return existing.file;
       return spill(text, id);
     });
 
-    lastPruneAt = now;
     stats.avoidedTokens += selection.reclaimedTokens;
     return { messages: pruned };
   });
