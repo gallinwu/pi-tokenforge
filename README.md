@@ -31,6 +31,7 @@ Reduction is chosen by shape, not by guessing:
 
 | Input shape | What happens |
 |---|---|
+| A test or build run | Passing lines are dropped; every failure, assertion diff, stack frame and summary survives verbatim. |
 | JSON with a uniform array (root, direct child, or `{data:{items:[…]}}` envelope) | Re-encoded as a table: one header line of keys, one CSV line per row. **Zero information loss.** |
 | Root map of uniform objects (`{id1:{…}, id2:{…}}`) | Re-encoded as rows with an added leading key column. Lossless. |
 | NDJSON / JSONL where every line has one shape | The whole log becomes a single table. Lossless. |
@@ -38,7 +39,7 @@ Reduction is chosen by shape, not by guessing:
 | Long prose or logs | Head/tail window, blank runs collapsed, repeated lines folded into a count, oversized lines trimmed in the middle. |
 | JSON too irregular to tabularize | Structural elision: long arrays keep head and tail, wide objects keep the first keys, long strings trimmed — with the omitted shape reported. |
 
-Each route is priced before it is adopted. The lossless route is tried first and wins whenever it clears the gate; lossy elision is only a fallback.
+Each route is priced before it is adopted. Lossless routes are tried first and win whenever they clear the gate; a lossy route must additionally pass the fidelity invariant, or it is rejected however much it saved.
 
 ### 2. Never-worse gate
 
@@ -76,6 +77,50 @@ This is the one operation that rewrites history the provider has already cached,
 When the catalog is larger than the cap, skills are scored against the current task by name and description overlap — no model call, because a judge model would cost more than the catalog it filters. The most relevant are kept, the rest are dropped for that turn, and the result is deterministic so the prefix does not churn.
 
 The filtered list is written back into the prompt options rather than string-replacing the rendered prompt, so the model still receives a well-formed native catalog.
+
+---
+
+## What this deliberately does not do
+
+Token savers go wrong in one specific way: they make the model miss the thing it
+was supposed to fix. Every technique that could do that was considered and left
+out, not overlooked.
+
+| Not included | Why |
+|---|---|
+| **Output brevity modes** | Compressing the model's *prose* compresses its reasoning. Output tokens are the wrong place to economise on a coding task. |
+| **A judge model** deciding what to cut | Adds cost, latency, and a new failure mode — a wrong verdict deletes evidence. Rules plus a verified invariant are auditable; a judge is not. |
+| **AST code skeletonization** | Replacing function bodies with signatures genuinely loses what an edit needs. Worth it only with per-file focus tracking, which is a different tool. |
+| **History retrieval tooling** | A search surface over compressed content helps, but it needs an index and adds a step before the model can act. The file path already in each notice is the cheaper version. |
+| **MCP schema folding** | Hiding tool schemas saves prompt bytes and costs tool-selection accuracy. Not a trade worth making silently. |
+| **Deterministic compaction** replacing semantic summaries | Code extraction cannot do semantic summarisation. Swapping them would quietly degrade the summary the model relies on after a long session. |
+
+The rule behind all six: a technique earns its place only if it is **lossless**,
+or **lossy with a one-step recovery the model is told about**. Anything that
+removes information the model might need to reason — with no way back — stays out,
+however many tokens it would save.
+
+---
+
+## The fidelity invariant
+
+Heuristics decide what to try. A separate check decides what is allowed to ship.
+
+Before any lossy reduction is adopted, the candidate is verified against the
+original: *every distinct evidence line in the original must still be present in
+the candidate.* "Evidence" is not guessed from position — it is a classifier over
+failure markers in the common test dialects, assertion diffs (`Expected:` /
+`Received:` on separate lines, as Jest and Vitest print them), stack frames in
+JS/Python form, exit codes, and run summaries.
+
+If a candidate dropped any of them, it is rejected even when it saved the most
+bytes. If the input carries more distinct evidence than the check will verify
+(512 lines), the answer is *unverifiable* and the reduction is declined — "could
+not confirm it is safe" must never read as "it is safe".
+
+This is the difference between "the heuristic should have kept the error" and
+"we checked that it did". `test/safety.test.ts` asserts it on fixtures built to
+trip each failure mode, and `harness/load.mjs` asserts it through the real hook.
 
 ---
 
@@ -145,6 +190,7 @@ Nothing to operate once installed. The command is the control surface:
 | Command | Effect |
 |---|---|
 | `/tokenforge` or `/tokenforge status` | Modes, reduction counts, byte savings, avoided vs billed tokens, cache hit rate, cost |
+| `/tokenforge audit` | Read-only: current context usage, how many tool results are in the session, the largest ones ranked, and notes drawn from what is actually on |
 | `/tokenforge on` / `off` | Master switch for all techniques |
 | `/tokenforge compress` | Toggle entry reduction |
 | `/tokenforge dedupe` | Toggle cross-turn dedupe |
@@ -153,6 +199,8 @@ Nothing to operate once installed. The command is the control surface:
 | `/tokenforge config` | Print the config file path and contents |
 | `/tokenforge spill` | Show the spill directory and recent originals |
 | `/tokenforge reset` | Zero the counters |
+
+`audit` never rewrites anything — it measures and reports. That is why it is safe to run mid-session when you suspect a tool is flooding the context.
 
 Switches persist to `~/.pi/agent/tokenforge/config.json` (honours `PI_CODING_AGENT_DIR`).
 
@@ -190,6 +238,8 @@ The model also gets one tool, `tokenforge_expand(id)`, to pull back a full origi
 | `skillMinKeep` | `5` | Never show fewer than this |
 | `noticeFullCount` | `3` | Verbose trailers before the compact form |
 
+Two limits are not configurable, on purpose. The evidence invariant always runs on lossy routes — there is no switch to turn off the check that keeps failures. And a reduction whose evidence cannot be verified is always declined, rather than admitted by default.
+
 ### A note on the cache
 
 Prompt caches match by prefix. Entry reduction, dedupe and skill disclosure all act **before** content is recorded, so they change only the newly appended segment — the prefix, and therefore the cache, is untouched.
@@ -205,34 +255,60 @@ These are enforced, not aspirational:
 1. **Reversible.** A failed write means no rewrite. `read` output and the expand tool's own output are never touched.
 2. **Lossless first.** A lossless route that clears the gate always beats a lossy one. Lossy notices state what was omitted, by category and count.
 3. **Double gate.** Ratio, absolute saving and token count must all improve.
-4. **Error protection.** Error output gets a higher size floor, and error-signalling lines inside an omitted region are retained with ±1 line of context — a bare assertion rarely explains itself.
-5. **Shape preservation.** Message count and roles never change; pruning replaces content, never removes a message.
-6. **Fail open.** Any uncertainty — unparseable JSON, unknown shape, missing usage data, unwritable disk — leaves the original alone.
+4. **Verified fidelity.** A lossy candidate that dropped any distinct evidence line is rejected, whatever it saved. Unverifiable input is declined, not admitted.
+5. **Deterministic.** The same input produces the same output, including across a session resume — pruning derives its id from message content, never from a clock.
+6. **Shape preservation.** Message count and roles never change; pruning replaces content, never removes a message.
+7. **Fail open.** Any uncertainty — unparseable JSON, unknown shape, missing usage data, unwritable disk — leaves the original alone.
 
 ---
 
 ## Verification
 
-Three independent layers, all runnable offline:
+Four independent layers, all runnable offline:
 
 ```bash
-# 1. Pure cores — reducers, gate, estimators, pruning selection, disclosure, metering
+# 1. Pure cores — reducers, gate, evidence invariant, pruning selection,
+#    disclosure, metering
 npm test
 
 # 2. Host harness — boots index.ts through pi's own loader against a fake host,
-#    then drives every hook and the command
+#    then drives every hook and every command
 node harness/load.mjs
 
 # 3. Runtime audit — boots pi's real DefaultResourceLoader against your live
 #    agent dir and reports what would actually load, and any duplicates
 node harness/audit.mjs
+
+# 4. Resume determinism — boots two independent module instances, prunes the
+#    same transcript in each, and compares every message byte for byte
+node harness/resume-repro.mjs
 ```
 
-The unit suite covers the gate refusing too-small, too-ratio-heavy and token-negative candidates; tabular plans rejecting mismatched keys, array-valued columns and deep nesting; dedupe fingerprints distinguishing long shared prefixes; pruning keeping the protected tail, skipping images, and never re-pruning a placeholder; and disclosure staying deterministic and order-preserving.
+106 unit tests across four suites. They cover the gate refusing too-small, too-ratio-heavy and token-negative candidates; tabular plans rejecting mismatched keys, array-valued columns and deep nesting; dedupe fingerprints distinguishing long shared prefixes; pruning keeping the protected tail, skipping images, never re-pruning a placeholder, and producing identical bytes on a second run; disclosure staying deterministic and order-preserving; and the evidence invariant rejecting any candidate that dropped a failure, an assertion diff or a stack frame.
+
+The harness covers 36 checks including the pruning watermark, the audit's read-only guarantee, and graceful degradation when a host cannot list session entries.
 
 ### Measured on a live session
 
-A 400-row JSON table (18,545 bytes) delivered through a `bash` tool call:
+**A test run** — a 500-case log with one failure (12,996 bytes):
+
+```
+[tokenforge #… reduced: 12,996 -> 132 bytes (~99% smaller). Need any omitted
+ detail? Call tokenforge_expand with id "…", or read the full original at: …]
+```
+
+What reached the model was 361 characters: the `FAIL` line, `Expected: 302`,
+`Received: 200`, `at login (src/auth.ts:42:11)` and the run summary. Zero `PASS`
+lines. The model was then asked for the expected code, the received code and the
+frame location — it answered `302 / 200 / src/auth.ts:42:11`, correct. That is
+the whole claim of this project in one measurement: 99% of the bytes gone, none
+of the information needed to act on them.
+
+The 499 passing lines still exist in `tool_execution_update` stream events, which
+is the pre-reduction stream shown to the terminal — that is the display path, not
+the model's context.
+
+**A JSON table** — 400 rows (18,545 bytes):
 
 ```
 [tokenforge #… losslessly re-encoded: 18,545 -> 6,968 bytes (~62% smaller),
@@ -248,7 +324,7 @@ That is one shape on one workload. Session-level savings depend entirely on how 
 
 ## Tags
 
-`pi` · `pi-coding-agent` · `pi-extension` · `token-optimization` · `context-engineering` · `context-compression` · `prompt-caching` · `tool-output` · `dedupe` · `llm` · `ai-agent` · `cli` · `typescript`
+`pi` · `pi-coding-agent` · `pi-extension` · `token-optimization` · `context-engineering` · `context-compression` · `prompt-caching` · `tool-output` · `dedupe` · `test-logs` · `llm` · `ai-agent` · `cli` · `typescript`
 
 ---
 

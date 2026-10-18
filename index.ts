@@ -235,6 +235,21 @@ function sessionIdOf(ctx: ExtensionContext): string | undefined {
   }
 }
 
+/**
+ * Session entries, or an empty list.
+ *
+ * The audit is a diagnostic; a host that cannot list entries should get "0 tool
+ * results", not an exception thrown out of a command handler.
+ */
+function safeEntries(ctx: ExtensionContext): unknown[] {
+  try {
+    const entries = ctx.sessionManager.getEntries();
+    return Array.isArray(entries) ? entries : [];
+  } catch {
+    return [];
+  }
+}
+
 // ---------------------------------------------------------------------------
 // extension
 // ---------------------------------------------------------------------------
@@ -454,7 +469,7 @@ export default function tokenForge(pi: ExtensionAPI) {
   // -- /tokenforge ----------------------------------------------------------
   pi.registerCommand("tokenforge", {
     description:
-      "TokenForge status and switches: status | on | off | compress | dedupe | prune | disclose | config | spill | reset",
+      "TokenForge status and switches: status | audit | on | off | compress | dedupe | prune | disclose | config | spill | reset",
     handler: async (args, ctx) => {
       const argv = (args || "").trim().split(/\s+/).filter(Boolean);
       const sub = (argv[0] || "status").toLowerCase();
@@ -498,6 +513,97 @@ export default function tokenForge(pi: ExtensionAPI) {
         case "config":
           notify("config file: " + CONFIG_FILE + "\n\n" + JSON.stringify(config, null, 2), "info");
           return;
+        case "audit": {
+          // Read-only: measures what is actually in the session and ranks the
+          // largest tool results. It never rewrites anything, so running it can
+          // not change the transcript or the cache.
+          const usage = ctx.getContextUsage();
+          const entries = safeEntries(ctx);
+
+          const offenders: Array<{ label: string; bytes: number; tokens: number }> = [];
+          let totalToolBytes = 0;
+          let toolResults = 0;
+
+          for (const entry of entries) {
+            const message = (entry as { message?: PrunableMessage }).message;
+            if (!message || message.role !== "toolResult") continue;
+            toolResults++;
+            const text = messageText(message);
+            if (!text) continue;
+            const bytes = utf8Bytes(text);
+            totalToolBytes += bytes;
+            offenders.push({
+              label: String(message.toolName ?? "tool"),
+              bytes,
+              tokens: estimateTokens(text),
+            });
+          }
+
+          offenders.sort((a, b) => b.bytes - a.bytes);
+
+          const lines: string[] = [];
+          if (usage) {
+            lines.push(
+              "context  " +
+                (usage.tokens === null ? "unknown" : formatInt(usage.tokens)) +
+                " / " +
+                formatInt(usage.contextWindow) +
+                (usage.percent === null ? "" : " (" + usage.percent.toFixed(1) + "%)"),
+            );
+          } else {
+            lines.push("context  unavailable");
+          }
+          lines.push(
+            "tool results  " + formatInt(toolResults) + " · " + formatInt(totalToolBytes) + " bytes total",
+          );
+
+          if (offenders.length > 0) {
+            lines.push("");
+            lines.push("largest tool results:");
+            for (let i = 0; i < Math.min(8, offenders.length); i++) {
+              const offender = offenders[i];
+              lines.push(
+                "  " +
+                  offender.label.padEnd(12) +
+                  formatInt(offender.bytes).padStart(10) +
+                  " bytes  ~" +
+                  formatInt(offender.tokens).padStart(8) +
+                  " tokens",
+              );
+            }
+          }
+
+          // Advice is derived from what is actually on, not from a fixed script.
+          const advice: string[] = [];
+          if (!config.compressEnabled) advice.push("compress is off — entry reduction is not running");
+          if (!config.dedupeEnabled) advice.push("dedupe is off — identical repeats are re-entering");
+          if (config.pruneEnabled) {
+            const hit = cacheHitRate(stats.billed);
+            if (hit !== null && hit < 85) {
+              advice.push(
+                "prune is on and the cache hit rate is " +
+                  hit +
+                  "% — pruning rewrites cached history; consider turning it off",
+              );
+            }
+          }
+          const bigTotal = offenders.reduce((sum, offender) => sum + offender.bytes, 0);
+          if (offenders.length > 0 && offenders[0].bytes > bigTotal * 0.5 && offenders[0].bytes > 20000) {
+            advice.push(
+              "one result is over half of all tool bytes (" +
+                offenders[0].label +
+                ") — narrowing that command is worth more than any setting",
+            );
+          }
+          if (advice.length > 0) {
+            lines.push("");
+            lines.push("notes:");
+            for (const note of advice) lines.push("  - " + note);
+          }
+
+          notify(lines.join("\n"), "info");
+          return;
+        }
         case "spill": {
           const entries = Array.from(spillIndex.entries()).slice(-10);
           notify(

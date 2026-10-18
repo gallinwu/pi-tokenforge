@@ -225,8 +225,13 @@ const bigJson = JSON.stringify({ data: { items: rows } });
     isError: true,
   });
   const out = result?.content?.[0]?.text ?? "";
-  check("verbose log reduced", out.includes("lines omitted"));
+
+  // A run of PASS lines is a test log, so the dedicated channel drops them all
+  // and keeps only the evidence. A generic window would also pass this, so the
+  // check asserts the failure detail rather than the strategy name.
+  check("verbose log reduced", out.length > 0 && out.length < lines.join("\n").length, out.length + " bytes");
   check("failure line survives", out.includes("FAIL src/auth.test.ts"));
+  check("pass lines dropped", !out.includes("PASS case 42"));
 }
 
 // -- 5. image-bearing results are never touched ----------------------------
@@ -392,7 +397,58 @@ const bigJson = JSON.stringify({ data: { items: rows } });
   await commands.get("tokenforge").handler("prune", ctx);
 }
 
-// -- 12. config persisted --------------------------------------------------
+// -- 12. audit is read-only and reports real sizes -------------------------
+{
+  const entries = [
+    { type: "message", message: { role: "user", content: "hello" } },
+    {
+      type: "message",
+      message: {
+        role: "toolResult",
+        toolName: "bash",
+        toolCallId: "a",
+        content: [{ type: "text", text: "x".repeat(30000) }],
+      },
+    },
+    {
+      type: "message",
+      message: {
+        role: "toolResult",
+        toolName: "read",
+        toolCallId: "b",
+        content: [{ type: "text", text: "y".repeat(1000) }],
+      },
+    },
+  ];
+
+  const auditCtx = makeContext({
+    sessionManager: { getSessionId: () => "audit-session", getEntries: () => entries },
+    getContextUsage: () => ({ tokens: 50000, contextWindow: 200000, percent: 25 }),
+  });
+
+  notifications.length = 0;
+  await commands.get("tokenforge").handler("audit", auditCtx);
+  const text = notifications.map((entry) => entry.message).join("\n");
+
+  check("audit reports context usage", text.includes("50,000"));
+  check("audit counts tool results", text.includes("2"));
+  check("audit ranks the largest first", text.indexOf("bash") < text.indexOf("read"));
+  check("audit names the dominant result", text.includes("narrowing that command"));
+
+  // Read-only invariant: the entries must come back untouched.
+  check("audit does not mutate entries", entries[1].message.content[0].text.length === 30000);
+}
+
+// -- 13. audit survives a host without entry listing -----------------------
+{
+  const bare = makeContext({ sessionManager: { getSessionId: () => "s" } });
+  notifications.length = 0;
+  await commands.get("tokenforge").handler("audit", bare);
+  const text = notifications.map((entry) => entry.message).join("\n");
+  check("audit degrades gracefully", text.includes("tool results"));
+}
+
+// -- 14. config persisted --------------------------------------------------
 {
   const configFile = path.join(
     process.env.PI_CODING_AGENT_DIR || path.join(os.homedir(), ".pi", "agent"),

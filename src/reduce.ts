@@ -11,6 +11,8 @@
  * with an absolute saving worth the churn. Otherwise the original goes out.
  */
 
+import { detectTestLog, reduceTestLog, verifyEvidenceBounded } from "./safety.ts";
+
 // ---------------------------------------------------------------------------
 // estimators
 // ---------------------------------------------------------------------------
@@ -766,16 +768,33 @@ export interface ReduceOptions extends GateOptions {
 
 /**
  * Route order, first passing candidate wins:
- * lossless tabular -> lossy elision -> NDJSON table -> line reduction.
+ * test-log reduction -> lossless tabular -> lossy elision -> NDJSON -> line window.
+ *
+ * Every lossy route must also clear the evidence invariant: a candidate that
+ * dropped a failure, an error, an assertion diff, a stack frame or a summary is
+ * rejected regardless of how many bytes it saved. That check is what separates
+ * this from a truncator — the gate asks "is it smaller", the invariant asks "is
+ * it still safe to reason from".
  */
 export function reduce(text: string, options: ReduceOptions): AdoptedReduction | null {
   const routes = jsonRoutes(text, options.maxParseBytes, options.minTabularRows);
   const ndjson = ndjsonRoute(text, options.maxParseBytes, options.minTabularRows);
   if (ndjson !== null) routes.push(ndjson);
 
+  // Lossless routes cannot drop evidence; they re-encode. Take one if it fits.
   for (let i = 0; i < routes.length; i++) {
+    if (!routes[i].lossless) continue;
     const adopted = gateRoute(routes[i], text, options);
     if (adopted !== null) return adopted;
+  }
+
+  // Lossy routes: gate first (cheap), then prove no evidence was lost.
+  const lossy: ReductionRoute[] = routes.filter((route) => !route.lossless);
+
+  const detection = detectTestLog(text);
+  if (detection.detected) {
+    const reduced = reduceTestLog(text);
+    lossy.unshift({ text: reduced.text, lossless: false, strategy: "test-log" });
   }
 
   const lines = reduceLines(text, {
@@ -787,7 +806,15 @@ export function reduce(text: string, options: ReduceOptions): AdoptedReduction |
     samples: options.tabularSamples,
     longLineChars: options.longLineChars,
   });
-  return gateRoute({ text: lines.text, lossless: false, strategy: lines.strategy }, text, options);
+  lossy.push({ text: lines.text, lossless: false, strategy: lines.strategy });
+
+  for (let i = 0; i < lossy.length; i++) {
+    const adopted = gateRoute(lossy[i], text, options);
+    if (adopted === null) continue;
+    if (!verifyEvidenceBounded(text, adopted.text).ok) continue;
+    return adopted;
+  }
+  return null;
 }
 
 /**
