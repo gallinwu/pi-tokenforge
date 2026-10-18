@@ -2,7 +2,7 @@
 
 **Cut what an agent carries, not what it can do.**
 
-A context-cost extension for the [pi](https://github.com/earendil-works/pi) coding agent. It applies five techniques, each independently switchable, each reversible, and each gated on a single rule: *a rewrite is only adopted if it is smaller in bytes **and** cheaper in tokens.* Otherwise the original goes out untouched.
+A context-cost extension for the [pi](https://github.com/earendil-works/pi) coding agent. It applies four techniques, each independently switchable, each reversible, and each gated on a single rule: *a rewrite is only adopted if it is smaller in bytes **and** cheaper in tokens.* Otherwise the original goes out untouched.
 
 ---
 
@@ -19,7 +19,9 @@ All of it is billed as input, all of it fills the window, and all of it dilutes 
 
 ---
 
-## The five techniques
+## The five mechanisms
+
+Four switchable techniques, plus the gate that governs all of them.
 
 ### 1. Structured reduction at entry
 
@@ -99,7 +101,7 @@ TokenForge is a pi extension. It follows pi's standard discovery and switching m
 **From a local checkout** — register it as a package, outside the auto-discovery directory, so it appears in pi's plugin list and can be switched on and off:
 
 ```bash
-# 0.13+ layout: ~/.pi/agent/packages/
+# Layout used by pi 1.3+: ~/.pi/agent/packages/
 cp -r pi-tokenforge ~/.pi/agent/packages/pi-tokenforge
 ```
 
@@ -132,7 +134,7 @@ Then in a session:
 /tokenforge status
 ```
 
-Requirements: pi 1.3.0 or newer, Node 20+.
+Tested against pi 1.3.0 on Node 24. The extension uses only documented extension APIs — `tool_result`, `context`, `before_agent_start`, `message_end`, `registerTool`, `registerCommand` — so it should track later versions, but that is a claim, not a measurement.
 
 ---
 
@@ -164,10 +166,10 @@ The model also gets one tool, `tokenforge_expand(id)`, to pull back a full origi
 
 | Key | Default | Meaning |
 |---|---|---|
-| `compressEnabled` | `true` | Technique 1 |
-| `dedupeEnabled` | `true` | Technique 3 |
-| `pruneEnabled` | `false` | Technique 5 — opt-in, see the cache note |
-| `discloseEnabled` | `true` | Technique 6 |
+| `compressEnabled` | `true` | Entry reduction |
+| `dedupeEnabled` | `true` | Cross-turn dedupe |
+| `pruneEnabled` | `false` | History pruning — opt-in, see the cache note |
+| `discloseEnabled` | `true` | Skill catalog disclosure |
 | `minSavingBytes` | `500` | Absolute saving the gate demands |
 | `keepRatioMax` | `0.72` | Ratio the gate demands |
 | `maxLines` / `headLines` / `tailLines` | `240` / `140` / `80` | Window shape for long text |
@@ -190,9 +192,9 @@ The model also gets one tool, `tokenforge_expand(id)`, to pull back a full origi
 
 ### A note on the cache
 
-Prompt caches match by prefix. Techniques 1, 2, 3 and 6 all act **before** content is recorded, so they change only the newly appended segment — the prefix, and therefore the cache, is untouched.
+Prompt caches match by prefix. Entry reduction, dedupe and skill disclosure all act **before** content is recorded, so they change only the newly appended segment — the prefix, and therefore the cache, is untouched.
 
-Technique 5 is different: it replaces content the provider has already cached, so each batch forces one prefix rebuild. That is why it is off by default, why it is rate limited, and why it only commits when the batch is large enough to amortize the rebuild. `/tokenforge status` shows the cache hit rate precisely so you can see whether it is paying off.
+History pruning is different: it replaces content the provider has already cached, so each batch forces one prefix rebuild. That is why it is off by default, why it is rate limited, and why it only commits when the batch is large enough to amortize the rebuild. `/tokenforge status` shows the cache hit rate precisely so you can see whether it is paying off.
 
 ---
 
